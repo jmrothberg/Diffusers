@@ -11,7 +11,10 @@ A PyTorch implementation of a conditional diffusion model for generating MNIST d
 - **Progress Tracking**: Regular sample generation during training
 
 ## Requirements
+
+```bash
 pip install torch torchvision matplotlib pillow
+```
 
 ## Model Architecture
 ### ConditionalUNet
