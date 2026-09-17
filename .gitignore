@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local virtualenv
+.venv/
+
+# Downloaded datasets (MNIST / CIFAR-10)
+data/
+
+# Model weights and periodic checkpoints (too large for GitHub)
+*.pt
+checkpoints_*/
+
+# Generated sample images
+samples_*/

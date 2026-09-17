@@ -265,18 +265,27 @@ class DiffusionModel:
                 alpha = self.alphas[i]
                 alpha_cumprod = self.alphas_cumprod[i]
                 beta = self.betas[i]
+                # FIX (Sep 2026): alpha_bar_{t-1}; defined as 1 at t=0 so the final step returns x_0_pred exactly
+                alpha_cumprod_prev = self.alphas_cumprod[i - 1] if i > 0 else torch.ones_like(alpha_cumprod)
                 
                 # Calculate mean for posterior q(x_{t-1} | x_t, x_0)
                 x_0_pred = (x - torch.sqrt(1. - alpha_cumprod) * predicted_noise) / \
                           torch.sqrt(alpha_cumprod)
                 x_0_pred = torch.clamp(x_0_pred, -1, 1)
                 
-                mean = (beta * x_0_pred + (1. - beta) * x) / torch.sqrt(alpha)
+                # FIX (Sep 2026): true DDPM posterior mean (Ho et al. 2020, Eq. 7).
+                # Old line was  mean = (beta*x_0_pred + (1-beta)*x)/sqrt(alpha)  which only removes a beta-sized
+                # fraction of the noise per step instead of beta/(1-alpha_bar), so samples stayed noisy even with
+                # a perfect noise predictor. MNIST hid this (+-1 pixels clamp clean); CIFAR mid-tones cannot.
+                mean = (torch.sqrt(alpha_cumprod_prev) * beta / (1. - alpha_cumprod)) * x_0_pred + \
+                       (torch.sqrt(alpha) * (1. - alpha_cumprod_prev) / (1. - alpha_cumprod)) * x
+                # FIX (Sep 2026): matching posterior variance beta_tilde_t (was beta_t)
+                posterior_variance = beta * (1. - alpha_cumprod_prev) / (1. - alpha_cumprod)
                 
                 # Only add noise for non-final steps
                 if i > 0:
                     noise = torch.randn_like(x)
-                    x = mean + torch.sqrt(beta) * noise
+                    x = mean + torch.sqrt(posterior_variance) * noise
                 else:
                     x = mean
             

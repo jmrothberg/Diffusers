@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchvision>=0.15.0
+matplotlib>=3.5.0
+pillow>=9.0.0
+numpy>=1.21.0
+# DGX Spark / GB10 (Sep 2026): use the CUDA-13 PyTorch build. Its newer cuDNN (9.24) has tuned Blackwell
+# convolution kernels; measured 2.1x faster fp32 and 3.8x with bf16+torch.compile vs the cu128 wheel.
+#   uv pip install --python .venv/bin/python --reinstall torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130
+# Revert to the previous build if ever needed:
+#   uv pip install --python .venv/bin/python --reinstall torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu128
