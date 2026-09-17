@@ -9,6 +9,10 @@ This codebase implements **conditional diffusion models** that can generate real
 - **MNIST Mode**: Generate images of specific handwritten digits (0-9)
 - **CIFAR-10 Mode**: Generate images of specific object classes (airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck)
 
+![CIFAR-10 samples, cifar10_optimized model, epoch 105, EMA weights — one column per class, 5 independent samples each](readme_images/cifar10_optimized_epoch105_ema.png)
+
+*`cifar10_optimized` (20M parameters, no attention) after 105 epochs (~41k steps) on a DGX Spark. Every image is 32x32 like the training data, shown 3x. Columns are the requested class; rows are 5 independent samples from the same weights.*
+
 ## 🚀 Key Features
 
 - **Conditional Generation**: Generate images of specific classes/digits
@@ -179,11 +183,19 @@ defaults are now `β from 2e-4 to 0.04`, which is DDPM's (1e-4 → 0.02 over 100
 - Nothing else — model, loss, training loop and the interactive menus are untouched. Because the
   fix is sampling-only, existing checkpoints do not need retraining.
 
-**Result on identical weights** (`cifar10_optimized`, 10 epochs, old sampler top 3 rows, fixed
-sampler bottom 3 rows): `samples_cifar10_optimized_fixed_sampler_test/epoch_10_old_vs_fixed_sampler.png`.
-Labeled per-class grids as training continues: `epoch_N_labeled.png` in the same folder. Expect
-blobs with correct scene colors in the first ~10 epochs and recognizable objects only after
-many tens of epochs — that is normal DDPM behaviour, not a remaining bug.
+**Result on identical weights** — `cifar10_optimized` after only 10 epochs, columns = classes 0-9.
+Top 3 rows: the old update rule. Bottom 3 rows: the corrected DDPM posterior. Same network, same
+weights, same random seed; only the sampler differs:
+
+![Same CIFAR-10 weights sampled with the old rule (top 3 rows) and the fixed rule (bottom 3 rows)](readme_images/cifar10_epoch10_old_sampler_vs_fixed.png)
+
+And the 218-epoch MNIST checkpoint that "always worked" — old rule top 2 rows, fixed rule bottom 2:
+
+![Same MNIST weights sampled with the old rule (top 2 rows) and the fixed rule (bottom 2 rows)](readme_images/mnist_epoch218_old_sampler_vs_fixed.png)
+
+Expect blobs with correct scene colors in the first ~10 epochs and recognizable objects only after
+many tens of epochs — that is normal DDPM behaviour, not a remaining bug (see the epoch-105 grid at
+the top of this file).
 
 ## 📊 Training Process
 
