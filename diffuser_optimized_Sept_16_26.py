@@ -1,6 +1,9 @@
-# mnistdiffuser_individual_Jan_20_25.py
+# diffuser_optimized_Sept_16_26.py   <- THIS IS THE SCRIPT TO RUN (MNIST and CIFAR-10)
 # Jonathan M. Rothberg
 # January 20, 2025  
+# September 16-17, 2026: renamed from diffuser_optimized_Oct_25_25.py. Fixed DDPM sampler (posterior
+#   mean/variance), corrected CIFAR beta schedule, EMA weights, horizontal flips for CIFAR,
+#   bf16 + torch.compile speed path, labeled 10x5 sample grids. See README.
 # Larger model with skip connections
 # Embedding dimension variable
 # Expanded attention layer

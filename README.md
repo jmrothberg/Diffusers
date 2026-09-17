@@ -42,27 +42,47 @@ This codebase implements **conditional diffusion models** that can generate real
 - **Group Normalization**: Better stability than batch normalization
 - **SiLU Activation**: Smooth, modern activation function
 
+## 📂 Which file do I run?
+
+**`diffuser_optimized_Sept_16_26.py` — this one.** It is the current, working implementation and the
+only script you need. It contains every fix and improvement from Sep 2026: corrected DDPM sampler,
+corrected CIFAR noise schedule, EMA weights, horizontal-flip augmentation, bf16 + `torch.compile`
+speed path, and the labeled 10x5 sample grids. It produced every image in this README.
+(It was called `diffuser_optimized_Oct_25_25.py` until Sep 17, 2026 — same file, renamed.)
+
+The other scripts are kept for history only:
+
+| File | What it is | Status |
+|---|---|---|
+| `mnistdiffuser_individual_Jan_21_25.py` | First version (Jan 2025). MNIST only, tiny model, one image at a time. | Legacy. Still has the original sampler bug. |
+| `diffuser_CIFAR_MNIST_Jan_23_25.py` | Added CIFAR-10 and a bigger U-Net. No attention, shared MNIST/CIFAR defaults, LR default 5e-3. | Legacy. Sampler bug fixed for consistency; otherwise unchanged. |
+| `diffuser_plot_loss_Oct_25_25.py` | Helper: plots loss curves from saved checkpoints. Not a trainer. | Utility. |
+
 ## 📋 Requirements
 
 ```bash
 pip install torch>=2.0.0 torchvision>=0.15.0 matplotlib>=3.5.0 pillow>=9.0.0 numpy>=1.21.0
 ```
 
+On a DGX Spark / GB10 use the CUDA-13 build instead — see `diffusers_requirements.txt` and
+"Speed on the DGX Spark" below.
+
 ## 🎮 Quick Start
 
 ### 1. Choose Your Dataset
 
 ```bash
-python diffuser_Multiparallel__attention5_Feb_24_25.py
+python diffuser_optimized_Sept_16_26.py
 ```
 
-The script will prompt you to choose between MNIST and CIFAR-10.
+The script will prompt you to choose between MNIST and CIFAR-10 (pick `3` for `CIFAR10_OPTIMIZED`,
+`4` for `MNIST_OPTIMIZED`).
 
 ### 2. Training Mode
 
 ```bash
 # Interactive training setup
-python diffuser_Multiparallel__attention5_Feb_24_25.py --mode train
+python diffuser_optimized_Sept_16_26.py --mode train
 ```
 
 The script will guide you through parameter selection with sensible defaults.
@@ -71,7 +91,7 @@ The script will guide you through parameter selection with sensible defaults.
 
 ```bash
 # Interactive image generation
-python diffuser_Multiparallel__attention5_Feb_24_25.py --mode inference
+python diffuser_optimized_Sept_16_26.py --mode inference
 ```
 
 Generate images of specific digits or object classes in real-time.
@@ -177,7 +197,7 @@ defaults are now `β from 2e-4 to 0.04`, which is DDPM's (1e-4 → 0.02 over 100
 500 steps: `ᾱ_T = 3.8e-5`, i.e. `x_T` is noise. MNIST defaults were left as they were.
 
 **What changed in the code** (every edit is commented `# FIX (Sep 2026)`):
-- `diffuser_optimized_Oct_25_25.py` → `DiffusionModel.sample()` and `sample_batch()`: correct
+- `diffuser_optimized_Sept_16_26.py` (then named `diffuser_optimized_Oct_25_25.py`) → `DiffusionModel.sample()` and `sample_batch()`: correct
   posterior mean and variance; CIFAR `beta_start`/`beta_end` defaults.
 - `diffuser_CIFAR_MNIST_Jan_23_25.py` → `DiffusionModel.sample()`: same sampler fix.
 - Nothing else — model, loss, training loop and the interactive menus are untouched. Because the
@@ -244,7 +264,7 @@ samples_mnist_linear_ts500_bs1e-05_be0.01_emb32/
 ### Interactive Mode
 
 ```bash
-python diffuser_Multiparallel__attention5_Feb_24_25.py --mode inference
+python diffuser_optimized_Sept_16_26.py --mode inference
 ```
 
 - Choose your dataset (MNIST/CIFAR-10)
@@ -255,7 +275,7 @@ python diffuser_Multiparallel__attention5_Feb_24_25.py --mode inference
 ### Programmatic Generation
 
 ```python
-from diffuser_Multiparallel__attention5_Feb_24_25 import DiffusionModel, ConditionalUNet
+from diffuser_optimized_Sept_16_26 import DiffusionModel, ConditionalUNet
 
 # Load trained model
 model = ConditionalUNet(num_classes=10, emb_dim=128, in_channels=3, use_attention=True)
@@ -269,13 +289,16 @@ sample = diffusion.sample(model, device, label=3, n_samples=1)
 
 ```
 /home/jonathan/Diffusers/
-├── diffuser_Multiparallel__attention5_Feb_24_25.py  # Main implementation
-├── diffusers_requirements.txt                      # Dependencies
+├── diffuser_optimized_Sept_16_26.py                # Main implementation - RUN THIS
+├── diffuser_CIFAR_MNIST_Jan_23_25.py               # Legacy (Jan 2025)
+├── mnistdiffuser_individual_Jan_21_25.py           # Legacy (Jan 2025, MNIST only)
+├── diffuser_plot_loss_Oct_25_25.py                 # Utility: plot loss curves from checkpoints
+├── diffusers_requirements.txt                      # Dependencies (+ DGX Spark install notes)
 ├── README.md                                       # This file
-├── data-20251024T142018Z-1-001/                    # Dataset storage
-│   └── data/
-│       ├── cifar-10-batches-py/                    # CIFAR-10 dataset
-│       └── MNIST/                                  # MNIST dataset
+├── readme_images/                                  # Images embedded in this README
+├── data/                                           # Dataset storage (git-ignored)
+│   ├── cifar-10-batches-py/                        # CIFAR-10 dataset
+│   └── MNIST/                                      # MNIST dataset
 ├── samples_*/                                       # Generated image grids
 ├── checkpoints_*/                                   # Periodic snapshots (every 10 epochs)
 ├── inference_samples/                              # Individual generated images
