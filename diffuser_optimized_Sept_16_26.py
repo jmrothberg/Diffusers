@@ -4,6 +4,8 @@
 # September 16-17, 2026: renamed from diffuser_optimized_Oct_25_25.py. Fixed DDPM sampler (posterior
 #   mean/variance), corrected CIFAR beta schedule, EMA weights, horizontal flips for CIFAR,
 #   bf16 + torch.compile speed path, labeled 10x5 sample grids. See README.
+#   Added the 'cifar10_ddpm' preset: DDPMUNet (Ho et al. 2020 U-Net, 36M params, attention, time embedding
+#   in every block) + classifier-free guidance. cifar10_optimized kept unchanged as the fast option.
 # Larger model with skip connections
 # Embedding dimension variable
 # Expanded attention layer
@@ -22,6 +24,8 @@ import tempfile
 import shutil
 import sys
 import copy  # EMA (Sep 2026): deepcopy of the model for the exponential moving average
+import math  # BEST (Sep 2026): sinusoidal timestep embedding in DDPMUNet
+import torch.nn.functional as F  # BEST (Sep 2026): silu / scaled_dot_product_attention in DDPMUNet
 
 """
 October 25, 2025 JMR
@@ -325,6 +329,165 @@ class SelfAttention(nn.Module):
         return attention_value.swapaxes(2, 1).view(x.shape[0], self.channels, *size)
 
 
+# =====================================================================================================
+# BEST (Sep 2026): the DDPM U-Net (Ho et al. 2020) - the architecture behind the published CIFAR-10
+# results - with class conditioning and classifier-free guidance. Used by the 'cifar10_ddpm' preset.
+# ConditionalUNet above is untouched and still used by every other preset.
+# =====================================================================================================
+def _timestep_embedding(t, dim):
+    """Sinusoidal embedding of integer timesteps t [B] -> [B, dim] (as in Transformers / DDPM)."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
+    args = t.float()[:, None] * freqs[None, :]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+
+
+class _ResBlock(nn.Module):
+    """GroupNorm-SiLU-conv, add time/class embedding, GroupNorm-SiLU-dropout-conv, + skip."""
+    def __init__(self, in_ch, out_ch, emb_ch, dropout):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(32, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.emb_proj = nn.Linear(emb_ch, out_ch)
+        self.norm2 = nn.GroupNorm(32, out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        nn.init.zeros_(self.conv2.weight); nn.init.zeros_(self.conv2.bias)  # block starts as identity (DDPM)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, emb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.emb_proj(F.silu(emb))[:, :, None, None]  # <- noise level + class injected HERE, every block
+        h = self.conv2(self.dropout(F.silu(self.norm2(h))))
+        return h + self.skip(x)
+
+
+class _AttnBlock(nn.Module):
+    """Multi-head self-attention over all pixels of a feature map, with residual."""
+    def __init__(self, ch, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.norm = nn.GroupNorm(32, ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        q, k, v = self.qkv(self.norm(x)).reshape(B, 3, self.heads, C // self.heads, H * W).unbind(1)
+        q, k, v = (z.transpose(-1, -2) for z in (q, k, v))          # [B, heads, HW, C/heads]
+        h = F.scaled_dot_product_attention(q, k, v)                  # [B, heads, HW, C/heads]
+        h = h.transpose(-1, -2).reshape(B, C, H, W)
+        return x + self.proj(h)
+
+
+class DDPMUNet(nn.Module):
+    """
+    BEST (Sep 2026): DDPM U-Net, ~35.7M parameters at the default settings.
+
+    Why it beats ConditionalUNet (each point matters for sample quality):
+      - Timestep -> sinusoidal embedding -> MLP, ADDED INSIDE EVERY residual block. ConditionalUNet only
+        concatenates t and class as constant input channels, so deep layers barely know the noise level.
+      - Class embedding is added to the time embedding. An extra "null" class (index num_classes) lets the
+        model train with label dropout and sample with classifier-free guidance (Ho & Salimans 2022).
+      - Residual blocks with dropout 0.1; 4 resolutions (32-16-8-4), channel multipliers (1,2,2,2);
+        self-attention at 16x16; a skip connection from every down block to the matching up block.
+      - Far less compute at full 32x32 resolution than ConditionalUNet, so a step is not slower.
+
+    Exposes the same attributes DiffusionModel / train() / checkpoints read from ConditionalUNet
+    (emb_dim, num_classes, timesteps, init_conv, use_attention, use_optimized_*), plus:
+      in_channels, null_class, cfg_dropout, use_ddpm_unet.
+    """
+    def __init__(self, num_classes=10, in_channels=3, timesteps=500, image_size=32, base_ch=128,
+                 ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_resolutions=(16,), dropout=0.1,
+                 cfg_dropout=0.1, emb_dim=128):
+        super().__init__()
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.timesteps = timesteps
+        self.emb_dim = emb_dim               # kept for checkpoint naming / compatibility checks only
+        self.null_class = num_classes        # label used for "no class" (classifier-free guidance)
+        self.cfg_dropout = cfg_dropout       # fraction of training labels replaced by null_class
+        self.use_attention = True
+        self.use_optimized_cifar10 = False
+        self.use_optimized_mnist = False
+        self.use_ddpm_unet = True
+
+        emb_ch = 4 * base_ch
+        self.base_ch = base_ch
+        self.time_mlp = nn.Sequential(nn.Linear(base_ch, emb_ch), nn.SiLU(), nn.Linear(emb_ch, emb_ch))
+        self.class_emb = nn.Embedding(num_classes + 1, emb_ch)   # +1 = null class
+
+        self.init_conv = nn.Sequential(nn.Conv2d(in_channels, base_ch, 3, padding=1))
+
+        # ---- down path ----
+        self.down = nn.ModuleList()
+        skip_chs = [base_ch]
+        ch, res = base_ch, image_size
+        for level, mult in enumerate(ch_mult):
+            out_ch = base_ch * mult
+            for _ in range(num_res_blocks):
+                blocks = nn.ModuleList([_ResBlock(ch, out_ch, emb_ch, dropout)])
+                ch = out_ch
+                if res in attn_resolutions:
+                    blocks.append(_AttnBlock(ch))
+                self.down.append(blocks)
+                skip_chs.append(ch)
+            if level != len(ch_mult) - 1:
+                self.down.append(nn.ModuleList([nn.Conv2d(ch, ch, 3, stride=2, padding=1)]))  # downsample
+                skip_chs.append(ch)
+                res //= 2
+
+        # ---- middle ----
+        self.mid = nn.ModuleList([_ResBlock(ch, ch, emb_ch, dropout), _AttnBlock(ch), _ResBlock(ch, ch, emb_ch, dropout)])
+
+        # ---- up path ----
+        self.up = nn.ModuleList()
+        for level, mult in reversed(list(enumerate(ch_mult))):
+            out_ch = base_ch * mult
+            for _ in range(num_res_blocks + 1):
+                blocks = nn.ModuleList([_ResBlock(ch + skip_chs.pop(), out_ch, emb_ch, dropout)])
+                ch = out_ch
+                if res in attn_resolutions:
+                    blocks.append(_AttnBlock(ch))
+                self.up.append(blocks)
+            if level != 0:
+                self.up.append(nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest'),
+                                              nn.Conv2d(ch, ch, 3, padding=1)]))                # upsample
+                res *= 2
+
+        self.out = nn.Sequential(nn.GroupNorm(32, ch), nn.SiLU(), nn.Conv2d(ch, in_channels, 3, padding=1))
+        nn.init.zeros_(self.out[-1].weight); nn.init.zeros_(self.out[-1].bias)
+
+    def forward(self, x, t, c):
+        t = torch.clamp(t, 0, self.timesteps - 1)
+        c = torch.clamp(c, 0, self.num_classes)          # num_classes itself is the valid null class
+        emb = self.time_mlp(_timestep_embedding(t, self.base_ch)) + self.class_emb(c)
+
+        h = self.init_conv(x)
+        hs = [h]
+        for blocks in self.down:
+            if isinstance(blocks[0], _ResBlock):
+                h = blocks[0](h, emb)
+                for m in blocks[1:]:
+                    h = m(h)
+            else:                                        # downsample conv
+                h = blocks[0](h)
+            hs.append(h)
+
+        h = self.mid[0](h, emb); h = self.mid[1](h); h = self.mid[2](h, emb)
+
+        for blocks in self.up:
+            if isinstance(blocks[0], _ResBlock):
+                h = blocks[0](torch.cat([h, hs.pop()], dim=1), emb)
+                for m in blocks[1:]:
+                    h = m(h)
+            else:                                        # upsample + conv
+                for m in blocks:
+                    h = m(h)
+        return self.out(h)
+
+
 class DiffusionModel:
     """
     Implements the diffusion process: gradually adding and removing noise from images.
@@ -364,7 +527,7 @@ class DiffusionModel:
        and gradually denoising with class guidance
     """
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, schedule_type='linear', 
-                 noise_scale=1.0, use_noise_scaling=False, cosine_s=0.008, emb_dim=128):
+                 noise_scale=1.0, use_noise_scaling=False, cosine_s=0.008, emb_dim=128, guidance_scale=0.0):
         self.timesteps = timesteps
         self.beta_start = beta_start
         self.beta_end = beta_end
@@ -373,9 +536,14 @@ class DiffusionModel:
         self.use_noise_scaling = use_noise_scaling
         self.cosine_s = cosine_s
         self.emb_dim = emb_dim
+        # CFG (Sep 2026): classifier-free guidance weight w (Ho & Salimans 2022). 0 = off (old behaviour).
+        # eps = (1+w)*eps(class) - w*eps(no class). Only used when the model has a null_class (DDPMUNet).
+        self.guidance_scale = guidance_scale
         
         # Modify name_suffix to include embedding dimension
         self.name_suffix = f"ts{timesteps}_bs{beta_start:.0e}_be{beta_end:.0e}_emb{emb_dim}"
+        if guidance_scale > 0:
+            self.name_suffix += f"_cfg{guidance_scale:g}"  # CFG (Sep 2026): keeps old folder names unchanged when off
         
         # Linear or cosine beta schedule
         if schedule_type == 'linear':
@@ -389,6 +557,22 @@ class DiffusionModel:
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+
+    def _predict_noise(self, model, x, t, labels):
+        """CFG (Sep 2026): one noise prediction, with classifier-free guidance if enabled and supported."""
+        model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+        if self.guidance_scale > 0 and hasattr(model_unwrapped, 'null_class'):
+            null = torch.full_like(labels, model_unwrapped.null_class)
+            eps_cond, eps_uncond = model(torch.cat([x, x]), torch.cat([t, t]), torch.cat([labels, null])).chunk(2)
+            return eps_uncond + (1.0 + self.guidance_scale) * (eps_cond - eps_uncond)
+        return model(x, t, labels)
+
+    @staticmethod
+    def _in_channels(model_unwrapped):
+        """BEST (Sep 2026): DDPMUNet exposes in_channels; ConditionalUNet is inferred from its first conv."""
+        if hasattr(model_unwrapped, 'in_channels'):
+            return model_unwrapped.in_channels
+        return model_unwrapped.init_conv[0].weight.shape[1] - (2 * model_unwrapped.emb_dim)
 
     def cosine_beta_schedule(self, timesteps, s=0.008):
         """
@@ -458,8 +642,8 @@ class DiffusionModel:
         emb_dim = model_unwrapped.emb_dim  # read from unwrapped model
         
         with torch.no_grad():
-            # The only line changed: subtract 2 * emb_dim instead of a fixed "32"
-            in_channels = model_unwrapped.init_conv[0].weight.shape[1] - (2 * emb_dim)
+            # BEST (Sep 2026): was  init_conv[0].weight.shape[1] - 2*emb_dim  (ConditionalUNet-only)
+            in_channels = self._in_channels(model_unwrapped)
             
             # The rest of your sample code is unchanged:
             image_size = 32 if in_channels == 3 else 28
@@ -469,7 +653,7 @@ class DiffusionModel:
             for i in reversed(range(self.timesteps)):
                 t = torch.full((n_samples,), i, device=device, dtype=torch.long)
                 
-                predicted_noise = model(x, t, labels)
+                predicted_noise = self._predict_noise(model, x, t, labels)  # CFG (Sep 2026): was model(x, t, labels)
                 alpha = self.alphas[i]
                 alpha_cumprod = self.alphas_cumprod[i]
                 beta = self.betas[i]
@@ -526,8 +710,8 @@ class DiffusionModel:
         num_samples = len(labels)
 
         with torch.no_grad():
-            # The only line changed: subtract 2 * emb_dim instead of a fixed "32"
-            in_channels = model_unwrapped.init_conv[0].weight.shape[1] - (2 * emb_dim)
+            # BEST (Sep 2026): was  init_conv[0].weight.shape[1] - 2*emb_dim  (ConditionalUNet-only)
+            in_channels = self._in_channels(model_unwrapped)
 
             # The rest of your sample code is unchanged:
             image_size = 32 if in_channels == 3 else 28
@@ -539,7 +723,7 @@ class DiffusionModel:
             for i in reversed(range(self.timesteps)):
                 t = torch.full((num_samples,), i, device=device, dtype=torch.long)
 
-                predicted_noise = model(x, t, labels_tensor)
+                predicted_noise = self._predict_noise(model, x, t, labels_tensor)  # CFG (Sep 2026): was model(...)
                 alpha = self.alphas[i]
                 alpha_cumprod = self.alphas_cumprod[i]
                 beta = self.betas[i]
@@ -861,6 +1045,13 @@ def train(model, diffusion, dataloader, optimizer, device, num_epochs, dataset_n
             images = images.to(device)
             labels = labels.to(device)
             
+            # CFG (Sep 2026): for models with a null class (DDPMUNet), replace a fraction of the labels with
+            # "no class" so the same network also learns unconditional denoising -> enables guidance at sampling.
+            cfg_p = getattr(model_unwrapped, 'cfg_dropout', 0.0)
+            if cfg_p > 0:
+                drop = torch.rand(labels.shape, device=device) < cfg_p
+                labels = torch.where(drop, torch.full_like(labels, model_unwrapped.null_class), labels)
+            
             # Sample random timesteps for the entire batch
             t = torch.randint(0, diffusion.timesteps, (images.shape[0],), device=device)
 
@@ -881,7 +1072,8 @@ def train(model, diffusion, dataloader, optimizer, device, num_epochs, dataset_n
             loss.backward()
             # Use higher gradient clipping for optimized models (smaller models need less clipping)
             model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
-            max_norm = 1.0 if (getattr(model_unwrapped, 'use_optimized_cifar10', False) or getattr(model_unwrapped, 'use_optimized_mnist', False)) else 0.5
+            max_norm = 1.0 if (getattr(model_unwrapped, 'use_optimized_cifar10', False) or getattr(model_unwrapped, 'use_optimized_mnist', False)
+                               or getattr(model_unwrapped, 'use_ddpm_unet', False)) else 0.5  # BEST (Sep 2026): DDPM uses 1.0
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
             optimizer.step()
             
@@ -922,7 +1114,9 @@ def train(model, diffusion, dataloader, optimizer, device, num_epochs, dataset_n
             'use_attention': model_unwrapped.use_attention,  # Use unwrapped model here
             'use_optimized_cifar10': model_unwrapped.use_optimized_cifar10,  # Add optimized flag
             'use_optimized_mnist': model_unwrapped.use_optimized_mnist,  # Add optimized flag
-            'ema_state_dict': ema_model.state_dict()  # EMA (Sep 2026): averaged weights used for sampling
+            'ema_state_dict': ema_model.state_dict(),  # EMA (Sep 2026): averaged weights used for sampling
+            'use_ddpm_unet': getattr(model_unwrapped, 'use_ddpm_unet', False),  # BEST (Sep 2026): which architecture
+            'guidance_scale': diffusion.guidance_scale  # CFG (Sep 2026): so inference uses the same guidance
         }
         
         # Save main checkpoint - FIXED to include timesteps in filename
@@ -980,14 +1174,19 @@ def inference_mode(model_path, device, dataset_name):
 
     # Create model with matching parameters from checkpoint
     in_channels = 3 if dataset_name.startswith('cifar10') else 1  # Handle both cifar10 and cifar10_optimized
-    model = ConditionalUNet(
-        timesteps=checkpoint['timesteps'],  # Use timesteps from checkpoint
-        in_channels=in_channels,
-        emb_dim=emb_dim_ckpt, # Use loaded emb_dim here
-        use_attention=checkpoint.get('use_attention', False), # Load use_attention from checkpoint, default to False if not found
-        use_optimized_cifar10=checkpoint.get('use_optimized_cifar10', False), # Load optimized flag from checkpoint
-        use_optimized_mnist=checkpoint.get('use_optimized_mnist', False) # Load optimized flag from checkpoint
-    ).to(device)
+    if checkpoint.get('use_ddpm_unet', False):
+        # BEST (Sep 2026): checkpoint was trained with the DDPM U-Net preset
+        model = DDPMUNet(num_classes=10, in_channels=in_channels, timesteps=checkpoint['timesteps'],
+                         image_size=32 if in_channels == 3 else 28, emb_dim=emb_dim_ckpt).to(device)
+    else:
+        model = ConditionalUNet(
+            timesteps=checkpoint['timesteps'],  # Use timesteps from checkpoint
+            in_channels=in_channels,
+            emb_dim=emb_dim_ckpt, # Use loaded emb_dim here
+            use_attention=checkpoint.get('use_attention', False), # Load use_attention from checkpoint, default to False if not found
+            use_optimized_cifar10=checkpoint.get('use_optimized_cifar10', False), # Load optimized flag from checkpoint
+            use_optimized_mnist=checkpoint.get('use_optimized_mnist', False) # Load optimized flag from checkpoint
+        ).to(device)
     
     # EMA (Sep 2026): prefer the averaged weights for generation when the checkpoint has them
     if 'ema_state_dict' in checkpoint:
@@ -1003,8 +1202,13 @@ def inference_mode(model_path, device, dataset_name):
         schedule_type=checkpoint.get('schedule_type', 'linear'),  # Default to linear if not found
         noise_scale=checkpoint.get('noise_scale', 1.0),
         use_noise_scaling=checkpoint.get('use_noise_scaling', False),
-        cosine_s=checkpoint.get('cosine_s', 0.008)
+        cosine_s=checkpoint.get('cosine_s', 0.008),
+        guidance_scale=checkpoint.get('guidance_scale', 0.0)  # CFG (Sep 2026): same guidance as during training
     )
+    # BEST (Sep 2026): 'cifar10', 'cifar10_optimized', 'cifar10_ddpm' are all CIFAR (was: dataset_name == 'cifar10',
+    # which showed the digit prompt and crashed imshow on 3-channel images for cifar10_optimized)
+    is_cifar = dataset_name.startswith('cifar10')
+    classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
     
     print("\nDiffusion Model Inference Mode")
     print("------------------------------")
@@ -1016,10 +1220,8 @@ def inference_mode(model_path, device, dataset_name):
     
     while True:
         try:
-            if dataset_name == 'cifar10':
+            if is_cifar:  # BEST (Sep 2026): was dataset_name == 'cifar10'
                 print("\nCIFAR10 classes:")
-                classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
-                          'dog', 'frog', 'horse', 'ship', 'truck']
                 for i, name in enumerate(classes):
                     print(f"{i}. {name}")
                 digit = int(input("\nEnter class number (0-9) or -1 to quit: "))
@@ -1033,7 +1235,7 @@ def inference_mode(model_path, device, dataset_name):
                 print("Please enter a number between 0 and 9")
                 continue
             
-            class_name = classes[digit] if dataset_name == 'cifar10' else str(digit)
+            class_name = classes[digit] if is_cifar else str(digit)  # BEST (Sep 2026): was == 'cifar10'
             print(f"\nGenerating {class_name}...")
             
             # Generate image
@@ -1048,9 +1250,9 @@ def inference_mode(model_path, device, dataset_name):
             # Display image
             plt.figure(figsize=(3, 3))
             img = sample.squeeze().cpu()
-            if dataset_name == 'cifar10':
+            if is_cifar:  # BEST (Sep 2026): was == 'cifar10'
                 img = img.permute(1, 2, 0)
-            plt.imshow(img, cmap=None if dataset_name == 'cifar10' else 'gray')
+            plt.imshow(img, cmap=None if is_cifar else 'gray')
             plt.axis('off')
             plt.title(f'Generated {class_name}')
             plt.show()
@@ -1108,6 +1310,8 @@ def main():
                            help='Embedding dimension (default: 128 for CIFAR, 32 for MNIST)')
         parser.add_argument('--use_attention', type=bool, default=None,
                            help='Use self-attention in the model')
+        parser.add_argument('--guidance_scale', type=float, default=None,
+                           help='CFG (Sep 2026): classifier-free guidance weight (cifar10_ddpm preset; 0 = off)')
         parser.add_argument('--num_gpus', type=int, default=None,
                            help='Number of GPUs to use (default: all available)')
         args = parser.parse_args()
@@ -1170,6 +1374,29 @@ def main():
                     'use_optimized_cifar10': True  # Enable optimized model architecture
                 }
             },
+            # BEST (Sep 2026): the published DDPM recipe (Ho et al. 2020) + classifier-free guidance. Same data,
+            # same corrected sampler as cifar10_optimized; only the network and the guidance differ. ~36M params.
+            # Schedule is the DDPM 1000-step one (1e-4..0.02) compressed to 500 steps, identical terminal SNR.
+            'cifar10_ddpm': {
+                'class': datasets.CIFAR10,
+                'in_channels': 3,
+                'image_size': 32,
+                'normalize': ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+                'defaults': {
+                    'timesteps': 500,
+                    'beta_start': 2e-4,
+                    'beta_end': 0.04,
+                    'batch_size': 128,          # DDPM paper value
+                    'learning_rate': 2e-4,      # DDPM paper value
+                    'schedule_type': 'linear',
+                    'cosine_s': 0.008,          # Not used with linear
+                    'noise_scale': 1.0,         # exact DDPM posterior noise; do NOT scale it
+                    'use_noise_scaling': False, # ...and do not decay it either
+                    'emb_dim': 128,             # only used in checkpoint / folder names for this model
+                    'guidance_scale': 2.0,      # classifier-free guidance w; 0 = off, 1-3 = sharper, more on-class
+                    'use_ddpm_unet': True       # selects DDPMUNet instead of ConditionalUNet
+                }
+            },
             'mnist_optimized': {
                 'class': datasets.MNIST,
                 'in_channels': 1,
@@ -1204,7 +1431,9 @@ def main():
         # Add dataset selection
         print("\nSelect dataset:")
         for idx, (name, info) in enumerate(DATASETS.items(), 1):
-            if name in ['cifar10_optimized', 'mnist_optimized']:
+            if name == 'cifar10_ddpm':  # BEST (Sep 2026)
+                print(f"{idx}. {name.upper()} ({info['image_size']}x{info['image_size']}, {info['in_channels']} channels) - BEST QUALITY (DDPM U-Net + guidance)")
+            elif name in ['cifar10_optimized', 'mnist_optimized']:
                 print(f"{idx}. {name.upper()} ({info['image_size']}x{info['image_size']}, {info['in_channels']} channels) - FASTER/BETTER")
             else:
                 print(f"{idx}. {name.upper()} ({info['image_size']}x{info['image_size']}, {info['in_channels']} channels)")
@@ -1289,7 +1518,9 @@ def main():
                 print("\nDynamic Noise Scaling:")
                 print("- If enabled: noise scale will decrease linearly during sampling")
                 print("- If disabled: noise scale will remain constant")
-                use_scaling = input("Enable dynamic noise scaling? (y/n, default=y): ").lower().strip() or "y"
+                # BEST (Sep 2026): default comes from the preset (cifar10_ddpm = n); other presets keep default=y
+                ns_default = 'y' if dataset_config['defaults'].get('use_noise_scaling', True) else 'n'
+                use_scaling = input(f"Enable dynamic noise scaling? (y/n, default={ns_default}): ").lower().strip() or ns_default
                 args.use_noise_scaling = use_scaling == 'y'
 
             print(f"\n• Learning Rate: {args.learning_rate}")
@@ -1335,8 +1566,14 @@ def main():
                 print("\nDynamic Noise Scaling:")
                 print("  - When enabled: noise decreases gradually during sampling")
                 print("  - When disabled: noise stays constant")
-                use_scaling = input("Enable dynamic noise scaling? (y/n, default=y): ").lower().strip() or "y"
+                # BEST (Sep 2026): default comes from the preset (cifar10_ddpm = n); other presets keep default=y
+                ns_default = 'y' if dataset_config['defaults'].get('use_noise_scaling', True) else 'n'
+                use_scaling = input(f"Enable dynamic noise scaling? (y/n, default={ns_default}): ").lower().strip() or ns_default
                 args.use_noise_scaling = use_scaling == 'y'
+            # CFG (Sep 2026): guidance weight prompt, only for presets that support it (cifar10_ddpm)
+            if 'guidance_scale' in dataset_config['defaults'] and args.guidance_scale is None:
+                print("\nClassifier-free guidance: 0 = off, 1-3 = sharper and more clearly the requested class")
+                args.guidance_scale = get_input_with_default("Guidance scale", dataset_config['defaults']['guidance_scale'])
 
             if args.schedule_type is None:
                 args.schedule_type = get_input_with_default("Noise Schedule (linear/cosine)", dataset_config['defaults']['schedule_type'], str)
@@ -1355,6 +1592,8 @@ def main():
                 print(f"\nUsing embedding dimension: {args.emb_dim}")
 
             # Now check if attention is None before asking
+            if dataset_config['defaults'].get('use_ddpm_unet', False):
+                args.use_attention = True  # BEST (Sep 2026): DDPMUNet always has attention at 16x16; nothing to ask
             if args.use_attention is None:
                 print("\nSelf-attention can improve image quality but increases training time and memory usage.")
                 use_attention = input("Use self-attention in the model? (y/n, default=y): ").lower().strip() or "y"
@@ -1456,19 +1695,32 @@ def main():
                 noise_scale=args.noise_scale,
                 use_noise_scaling=args.use_noise_scaling,
                 cosine_s=args.cosine_s,
-                emb_dim=args.emb_dim
+                emb_dim=args.emb_dim,
+                guidance_scale=args.guidance_scale or 0.0  # CFG (Sep 2026): None/0 -> off (unchanged behaviour)
             )
 
             # Create model with correct channels
-            model = ConditionalUNet(
-                num_classes=10,
-                emb_dim=args.emb_dim,
-                timesteps=args.timesteps,
-                in_channels=dataset_config['in_channels'],
-                use_attention=args.use_attention,
-                use_optimized_cifar10=dataset_config['defaults'].get('use_optimized_cifar10', False),
-                use_optimized_mnist=dataset_config['defaults'].get('use_optimized_mnist', False)
-            ).to(device)
+            if dataset_config['defaults'].get('use_ddpm_unet', False):
+                # BEST (Sep 2026): DDPM U-Net for the cifar10_ddpm preset
+                model = DDPMUNet(
+                    num_classes=10,
+                    in_channels=dataset_config['in_channels'],
+                    timesteps=args.timesteps,
+                    image_size=dataset_config['image_size'],
+                    emb_dim=args.emb_dim
+                ).to(device)
+                print(f"DDPMUNet: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, "
+                      f"guidance scale {diffusion.guidance_scale}")
+            else:
+                model = ConditionalUNet(
+                    num_classes=10,
+                    emb_dim=args.emb_dim,
+                    timesteps=args.timesteps,
+                    in_channels=dataset_config['in_channels'],
+                    use_attention=args.use_attention,
+                    use_optimized_cifar10=dataset_config['defaults'].get('use_optimized_cifar10', False),
+                    use_optimized_mnist=dataset_config['defaults'].get('use_optimized_mnist', False)
+                ).to(device)
             
             # Multi-GPU setup with specific device selection
             if args.num_gpus > 1:

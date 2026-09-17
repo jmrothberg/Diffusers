@@ -75,8 +75,16 @@ On a DGX Spark / GB10 use the CUDA-13 build instead — see `diffusers_requireme
 python diffuser_optimized_Sept_16_26.py
 ```
 
-The script will prompt you to choose between MNIST and CIFAR-10 (pick `3` for `CIFAR10_OPTIMIZED`,
-`4` for `MNIST_OPTIMIZED`).
+The script will prompt you to choose a dataset preset:
+
+| Menu | Preset | Network | Use it when |
+|---|---|---|---|
+| `3` | `CIFAR10_OPTIMIZED` | `ConditionalUNet`, 20M params, no attention | Fast; the "good enough" CIFAR option. Plateaus at the quality shown at the top of this README. |
+| `4` | `CIFAR10_DDPM` | `DDPMUNet`, 36M params, attention, classifier-free guidance | **Best quality.** The published DDPM recipe. See "Why CIFAR plateaus — and the `cifar10_ddpm` option". |
+| `5` | `MNIST_OPTIMIZED` | `ConditionalUNet`, small | MNIST. |
+
+(`1`/`2` are the original `mnist` / `cifar10` presets, kept for compatibility; the `cifar10` one is a
+791M-parameter network and is not recommended.)
 
 ### 2. Training Mode
 
@@ -241,6 +249,55 @@ the top of this file).
   saved before this change simply initialise the EMA from the live weights on resume.
 - **Random horizontal flip** — applied to CIFAR-10 only (`in_channels == 3`), never to MNIST (a mirrored
   digit is a different digit). Doubles the effective training set; standard for DDPM on CIFAR-10.
+
+### Why CIFAR plateaus — and the `cifar10_ddpm` option (added Sep 2026)
+
+After all the fixes above, `cifar10_optimized` produces the images at the top of this README and then
+stops improving: the average loss went 0.0315 → 0.0300 between epochs 44 and 168 and has been flat since
+about epoch 130. Objects are recognisable but rarely crisp. Three things were suspected; the homework
+rules two of them out:
+
+- **Not the data.** The 50,000 CIFAR-10 training images are exactly what Ho et al. (2020) used to reach
+  FID 3.17 — near-photographic 32x32 samples. There is no bigger drop-in dataset with the same classes at
+  this resolution (CINIC-10 pads it with down-sampled ImageNet, a different distribution). Nothing to download.
+- **Not the size.** The paper's network is 35.7M parameters. `cifar10_optimized` is 20.8M and the original
+  `cifar10` preset is 791M and *worse* — so parameter count is not the lever.
+- **The design.** `ConditionalUNet` differs from the published U-Net in ways that each cost quality:
+
+| | `ConditionalUNet` (`cifar10_optimized`) | `DDPMUNet` (`cifar10_ddpm`) |
+|---|---|---|
+| How the network knows the noise level *t* | *t* and the class are concatenated as constant input channels, once, at the input | Sinusoidal *t* embedding → MLP, **added inside every residual block** so every layer knows how noisy its input is |
+| Blocks | plain conv → GroupNorm → SiLU stacks | residual blocks with dropout 0.1 |
+| Resolutions | 32 → 16 → 8 (2 down-samples) | 32 → 16 → 8 → 4, channel widths 128·(1,2,2,2) |
+| Attention | none | self-attention at 16x16 and in the middle block |
+| Skip connections | one per resolution level | one from every down block to its matching up block |
+| Class conditioning | input channels only | embedding added to *t*, plus a **"null" class** trained with 10 % label dropout |
+| Sampling | plain conditional | **classifier-free guidance** (Ho & Salimans 2022): `eps = (1+w)·eps(class) − w·eps(null)`, default *w* = 2 |
+| Parameters | 20.8M | 35.7M (same as the paper) |
+| Step time on the GB10 | 204 ms | ~300 ms (far less work at full 32x32 resolution) |
+
+Classifier-free guidance is the single biggest visual win for a *class-conditional* model: the network is
+asked "what does this noise look like with the class vs. without", and the difference is amplified, which
+pushes every sample toward unmistakably being the requested class. It costs two forward passes per
+sampling step (the two are batched together, so sampling time roughly doubles), and nothing during training
+beyond replacing 10 % of labels with the null class.
+
+**How to use it:** pick `4. CIFAR10_DDPM` in the menu and press Enter through the prompts. The defaults are
+the paper's (batch 128, LR 2e-4, dropout 0.1, gradient clip 1.0, EMA 0.9999, noise scale 1.0 with dynamic
+scaling *off*) plus `Guidance scale = 2.0` (0 turns guidance off; 1–3 is the useful range; higher = sharper
+and more on-class but less varied). Everything else — corrected sampler, schedule, EMA, flips, bf16 +
+`torch.compile`, labeled grids, checkpoints, inference — is shared with the other presets. Samples land in
+`samples_cifar10_ddpm_linear_ts500_bs2e-04_be4e-02_emb128_cfg2_attention/`; the checkpoint records
+`use_ddpm_unet` and `guidance_scale`, so inference rebuilds the right network with the same guidance.
+
+**How long:** after **one** epoch (391 steps) the new network already lays out class-consistent scenes
+(sky behind airplanes, water under ships, foliage around frogs) — the old one needed ~10 epochs for that.
+The paper trained for 800k steps (≈2000 epochs at batch 128); good samples appear far earlier, and
+visible improvement should continue well past the 130-epoch wall of `cifar10_optimized`. The default run
+is 400 epochs (~156k steps); training resumes from the checkpoint if you stop and restart.
+
+`cifar10_optimized` is unchanged and still in the menu — it is the quick option; `cifar10_ddpm` is the
+quality option.
 
 ### Sample Generation During Training
 
