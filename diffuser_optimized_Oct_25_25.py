@@ -572,14 +572,19 @@ class DiffusionModel:
             # Return list of individual samples
             return [x[i:i+1] for i in range(num_samples)]
 
-def save_samples(model, diffusion, device, epoch, avg_loss, dataset_name, batch_idx=None, use_batch_inference=True):
+def save_samples(model, diffusion, device, epoch, avg_loss, dataset_name, batch_idx=None, use_batch_inference=True,
+                 samples_per_class=5):
     """
     Saves and displays a grid of all classes (0-9)
 
     Args:
         use_batch_inference: If True, use batch generation. If False, use sequential generation.
                            This preference is set once at the beginning of training.
+        samples_per_class: GRID (Sep 2026) rows in the grid; one column per class, class name printed on top.
     """
+    # GRID (Sep 2026): human-readable column headers
+    CIFAR_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+    class_names = CIFAR_CLASSES if dataset_name.startswith('cifar10') else [str(i) for i in range(10)]
     # Check for DataParallel and access wrapped model properly
     model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
 
@@ -592,13 +597,16 @@ def save_samples(model, diffusion, device, epoch, avg_loss, dataset_name, batch_
     print("\nGenerating all digits...")
     samples = []
 
+    # GRID (Sep 2026): row-major label order -> row r of the grid is the r-th sample of every class
+    labels = list(range(10)) * samples_per_class
+
     if use_batch_inference:
         # NEW: Batch generation - generate all classes at once
         try:
             print("Using batch generation (10x faster)...")
-            # Generate all 10 classes in one batch
-            batch_samples = diffusion.sample_batch(model, device, list(range(10)))
-            samples = [batch_samples[i] for i in range(10)]
+            # Generate all 10 classes (x samples_per_class) in one batch
+            batch_samples = diffusion.sample_batch(model, device, labels)
+            samples = [batch_samples[i] for i in range(len(labels))]
             print("Batch generation successful!")
         except Exception as e:
             print(f"Batch generation failed ({e}), falling back to sequential...")
@@ -607,18 +615,33 @@ def save_samples(model, diffusion, device, epoch, avg_loss, dataset_name, batch_
     if not use_batch_inference:
         # ORIGINAL: Sequential generation (fallback)
         print("Using sequential generation...")
-        for i in range(10):
+        for i in labels:
             # Generate one sample at a time with same model parameters
             sample = diffusion.sample(model, device, i, n_samples=1)
             samples.append(sample)
 
     # Create and save the grid
     samples = torch.cat(samples, dim=0)
-    grid = utils.make_grid(samples, nrow=5, normalize=True)
+    # GRID (Sep 2026): 10 columns = classes; no normalize=True any more - samples are already in [0,1] and
+    # per-grid renormalisation used to hide brightness/contrast problems (it is what made the old speckled
+    # MNIST grids look clean). Upscaled 3x nearest-neighbour and given a class-name header.
+    grid = utils.make_grid(samples, nrow=10, padding=2, pad_value=1.0)
+    img = Image.fromarray((grid.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype('uint8'))
+    scale = 3
+    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    header, footer = 22, 18
+    canvas = Image.new('RGB', (img.width, img.height + header + footer), 'white')
+    canvas.paste(img, (0, header))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(canvas)
+    cell = (samples.shape[-1] + 2) * scale  # image width + padding, in canvas pixels
+    for i, name in enumerate(class_names):
+        draw.text((2 * scale + i * cell + 4, 5), name, fill='black')
+    draw.text((4, canvas.height - footer + 3), f'epoch {epoch}   loss {avg_loss:.4f}   (EMA weights)', fill='gray')
 
     # Save the grid
     filename = f'{sample_dir}/epoch_{epoch}_loss_{avg_loss:.4f}.png' if batch_idx is None else f'{sample_dir}/epoch_{epoch}_batch_{batch_idx}_loss_{avg_loss:.4f}.png'
-    utils.save_image(grid, filename)
+    canvas.save(filename)  # GRID (Sep 2026): was utils.save_image(grid, filename)
     method = "batch" if use_batch_inference else "sequential"
     print(f"\nSaved grid of all digits to {filename} (using {method} generation)")
     

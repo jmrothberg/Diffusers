@@ -212,7 +212,12 @@ many tens of epochs — that is normal DDPM behaviour, not a remaining bug.
 
 ### Sample Generation During Training
 
-Every epoch, the model generates a grid of all classes (0-9) to monitor progress:
+Every epoch, the model generates a grid of all classes (0-9) to monitor progress. Since Sep 2026 the
+grid is **10 columns (one per class, class name printed above: digit for MNIST, object name for
+CIFAR-10) x 5 rows (5 independent samples per class)**, upscaled 3x for viewing, with the epoch and
+loss in the footer. Samples come from the EMA weights. Pixels are shown as generated (no per-grid
+renormalisation), so brightness/contrast problems are visible instead of hidden. Change
+`samples_per_class` in `save_samples()` for more or fewer rows.
 
 ```
 samples_mnist_linear_ts500_bs1e-05_be0.01_emb32/
