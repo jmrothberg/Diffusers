@@ -292,12 +292,16 @@ and more on-class but less varied). Everything else — corrected sampler, sched
 
 **How long:** after **one** epoch (391 steps) the new network already lays out class-consistent scenes
 (sky behind airplanes, water under ships, foliage around frogs) — the old one needed ~10 epochs for that.
-The paper trained for 800k steps (≈2000 epochs at batch 128); good samples appear far earlier, and
-visible improvement should continue well past the 130-epoch wall of `cifar10_optimized`. The default run
-is 400 epochs (~156k steps); training resumes from the checkpoint if you stop and restart.
+The paper trained for 800k steps (≈2000 epochs at batch 128). This run is at **epoch 283** (~111k steps,
+loss 0.0288, EMA weights) — past the 130-epoch wall of `cifar10_optimized`, and still sharper than that
+preset. The default run is 400 epochs (~156k steps); training resumes from the checkpoint if you stop and restart.
 
 `cifar10_optimized` is unchanged and still in the menu — it is the quick option; `cifar10_ddpm` is the
 quality option.
+
+![CIFAR-10 samples, cifar10_ddpm model, epoch 283, EMA weights — one column per class, 5 independent samples each](readme_images/cifar10_ddpm_epoch283_ema.png)
+
+*`cifar10_ddpm` (36M-parameter DDPM U-Net, attention, classifier-free guidance w=2) after 283 epochs (~111k steps) on a DGX Spark. EMA weights, loss 0.0288. Same 10x5 layout as the `cifar10_optimized` grid at the top of this file.*
 
 ### Sample Generation During Training
 
